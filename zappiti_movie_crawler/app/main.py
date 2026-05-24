@@ -59,6 +59,7 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "libraries": ["FILME", "SERIEN", "DEMOS"],
     "smb_username": "guest",
     "smb_password": "guest",
+    "smb_require_signing": False,
     "prefer_mounted_paths": True,
     "enable_smb_fallback": True,
     "min_file_size_mb": 10,
@@ -96,6 +97,8 @@ def configure_logging() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         stream=sys.stdout,
     )
+    logging.getLogger("smbclient").setLevel(logging.WARNING)
+    logging.getLogger("smbprotocol").setLevel(logging.WARNING)
 
 
 def request_stop(signum: int, _frame: Any) -> None:
@@ -361,10 +364,12 @@ class SourceScanner:
 
         server, _share, _subpath = parsed
         try:
+            smbclient.reset_connection_cache()
             smbclient.register_session(
                 server,
                 username=str(self.options.get("smb_username") or ""),
                 password=str(self.options.get("smb_password") or ""),
+                require_signing=bool(self.options.get("smb_require_signing", False)),
             )
         except Exception as exc:  # noqa: BLE001
             status["message"] = f"SMB login failed: {exc}"
