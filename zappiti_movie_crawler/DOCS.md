@@ -23,7 +23,9 @@ The add-on first tries the Home Assistant media mount. If your network storage i
 
 For guest SMB access, `smb_require_signing` and `smb_require_secure_negotiate` default to `false` because SMB guest sessions cannot satisfy mandatory client-side signing or negotiate verification. If your SMB server requires authenticated signed sessions, set real credentials and enable these checks.
 
-Catalog writes and GitHub publishing are skipped when the scan is incomplete. By default, `publish_require_all_sources_reachable` requires every configured source to be reachable and `publish_allow_empty_catalog` prevents replacing the last good catalog with an empty one.
+Catalog writes and GitHub publishing are skipped when the scan is incomplete. By default, `publish_require_all_sources_reachable` requires every configured source and library folder to be reachable, and `publish_allow_empty_catalog` prevents replacing the last good catalog with an empty one.
+
+Before the add-on writes local files or publishes to GitHub, it validates the catalog counts, required asset files, JSON parseability, missing item IDs, and duplicate item IDs. A failed run leaves the previous data in place; no update is better than replacing known-good data with incomplete or invalid output.
 
 ## Required Configuration
 
