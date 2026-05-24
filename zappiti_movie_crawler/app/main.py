@@ -188,6 +188,19 @@ def should_skip_path(parts: list[str]) -> bool:
     return any(part.startswith(".") or part.lower() in skip_names for part in parts)
 
 
+def directory_preview(path: Path, limit: int = 12) -> str:
+    try:
+        names = sorted(child.name for child in path.iterdir())
+    except OSError as exc:
+        return f"cannot list entries: {exc}"
+    if not names:
+        return "empty"
+    preview = ", ".join(names[:limit])
+    if len(names) > limit:
+        preview = f"{preview}, ... (+{len(names) - limit} more)"
+    return preview
+
+
 def build_item(
     source_name: str,
     library: str,
@@ -229,8 +242,16 @@ class SourceScanner:
     def scan(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         if self.options.get("prefer_mounted_paths", True):
             items, status = self.scan_mounted_path()
-            if status["reachable"]:
+            if status["reachable"] and items:
                 return items, status
+            if status["reachable"] and not self.options.get("enable_smb_fallback", True):
+                return items, status
+            if status["reachable"]:
+                logging.warning(
+                    "Mounted path %s for %s yielded 0 files; trying SMB fallback.",
+                    status["path"],
+                    self.name,
+                )
 
         if self.options.get("enable_smb_fallback", True):
             return self.scan_smb()
@@ -250,16 +271,26 @@ class SourceScanner:
         }
         if not root.is_dir():
             status["message"] = "Mounted path is not available."
+            logging.warning("Mounted path %s for %s is not available.", root, self.name)
             return [], status
 
         items: list[dict[str, Any]] = []
         status["reachable"] = True
+        logging.info("Mounted path %s for %s is available. Top-level entries: %s", root, self.name, directory_preview(root))
         for library in self.libraries:
             library_path = root / library
-            library_status = {"name": library, "reachable": False, "files": 0}
+            library_status = {
+                "name": library,
+                "reachable": False,
+                "files": 0,
+                "visited_files": 0,
+                "skipped_extension": 0,
+                "skipped_size": 0,
+            }
             if not library_path.is_dir():
                 library_status["message"] = "Library folder is not available."
                 status["libraries"].append(library_status)
+                logging.warning("Library folder %s for %s is not available.", library_path, self.name)
                 continue
 
             library_status["reachable"] = True
@@ -269,7 +300,9 @@ class SourceScanner:
                         break
                     if not path.is_file():
                         continue
+                    library_status["visited_files"] += 1
                     if path.suffix.lower() not in VIDEO_EXTENSIONS:
+                        library_status["skipped_extension"] += 1
                         continue
                     relative_parts = list(path.relative_to(library_path).parts[:-1])
                     if should_skip_path([library, *relative_parts, path.name]):
@@ -280,6 +313,7 @@ class SourceScanner:
                         logging.warning("Cannot stat %s: %s", path, exc)
                         continue
                     if stat.st_size < self.min_size_bytes:
+                        library_status["skipped_size"] += 1
                         continue
                     items.append(
                         build_item(
@@ -297,6 +331,15 @@ class SourceScanner:
                 library_status["message"] = str(exc)
                 logging.warning("Cannot scan %s: %s", library_path, exc)
             status["libraries"].append(library_status)
+            logging.info(
+                "Library %s/%s scanned: %s files accepted, %s file entries seen, %s skipped by extension, %s skipped below minimum size.",
+                self.name,
+                library,
+                library_status["files"],
+                library_status["visited_files"],
+                library_status["skipped_extension"],
+                library_status["skipped_size"],
+            )
 
         status["files"] = len(items)
         return items, status
@@ -332,9 +375,16 @@ class SourceScanner:
         status["reachable"] = True
         for library in self.libraries:
             library_root = join_unc(unc, library)
-            library_status = {"name": library, "reachable": False, "files": 0}
+            library_status = {
+                "name": library,
+                "reachable": False,
+                "files": 0,
+                "visited_files": 0,
+                "skipped_extension": 0,
+                "skipped_size": 0,
+            }
             try:
-                for item in self.walk_smb_library(library, library_root, []):
+                for item in self.walk_smb_library(library, library_root, [], library_status):
                     items.append(item)
                     library_status["files"] += 1
                 library_status["reachable"] = True
@@ -342,11 +392,27 @@ class SourceScanner:
                 library_status["message"] = str(exc)
                 logging.warning("Cannot scan SMB folder %s: %s", library_root, exc)
             status["libraries"].append(library_status)
+            if library_status["reachable"]:
+                logging.info(
+                    "SMB library %s/%s scanned: %s files accepted, %s file entries seen, %s skipped by extension, %s skipped below minimum size.",
+                    self.name,
+                    library,
+                    library_status["files"],
+                    library_status["visited_files"],
+                    library_status["skipped_extension"],
+                    library_status["skipped_size"],
+                )
 
         status["files"] = len(items)
         return items, status
 
-    def walk_smb_library(self, library: str, directory: str, relative_parts: list[str]) -> list[dict[str, Any]]:
+    def walk_smb_library(
+        self,
+        library: str,
+        directory: str,
+        relative_parts: list[str],
+        counters: dict[str, Any],
+    ) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         for entry in smbclient.scandir(directory):
             if STOP_REQUESTED:
@@ -356,13 +422,16 @@ class SourceScanner:
                 continue
             child = join_unc(directory, name)
             if entry.is_dir():
-                items.extend(self.walk_smb_library(library, child, [*relative_parts, name]))
+                items.extend(self.walk_smb_library(library, child, [*relative_parts, name], counters))
                 continue
+            counters["visited_files"] += 1
             if not entry.is_file() or Path(name).suffix.lower() not in VIDEO_EXTENSIONS:
+                counters["skipped_extension"] += 1
                 continue
             stat = entry.stat()
             size = getattr(stat, "st_size", None)
             if size is not None and int(size) < self.min_size_bytes:
+                counters["skipped_size"] += 1
                 continue
             modified = iso_from_timestamp(getattr(stat, "st_mtime", None))
             items.append(build_item(self.name, library, relative_parts, name, size, modified, smb_path=child))
