@@ -21,6 +21,8 @@ Configured sources are:
 
 The add-on first tries the Home Assistant media mount. If your network storage is mounted under `/share` instead of `/media`, change `mounted_path` in the add-on options to `/share/Zappiti1` and `/share/Zappiti2`. If the Zappiti is off or the mount is unavailable, it tries direct SMB with the configured credentials. Offline shares are logged and recorded in the summary instead of failing the whole scan.
 
+Catalog writes and GitHub publishing are skipped when the scan is incomplete. By default, `publish_require_all_sources_reachable` requires every configured source to be reachable and `publish_allow_empty_catalog` prevents replacing the last good catalog with an empty one.
+
 ## Required Configuration
 
 Set `github_token` in the add-on configuration. The token needs permission to write contents to `volatile1990/eclipse-cinema-homepage`.

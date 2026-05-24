@@ -1,5 +1,5 @@
 name: Zappiti Movie Crawler
-version: "0.1.1"
+version: "0.1.2"
 slug: zappiti_movie_crawler
 description: Crawl Zappiti movie shares and publish the catalog to GitHub assets.
 url: https://github.com/volatile1990/movie-crawler
@@ -50,6 +50,8 @@ options:
   github_commit_message: "Update Zappiti media catalog"
   local_output_dir: /data/output
   request_timeout_seconds: 20
+  publish_require_all_sources_reachable: true
+  publish_allow_empty_catalog: false
 schema:
   sources:
     - name: str
@@ -79,3 +81,5 @@ schema:
   github_commit_message: str
   local_output_dir: str
   request_timeout_seconds: int
+  publish_require_all_sources_reachable: bool
+  publish_allow_empty_catalog: bool

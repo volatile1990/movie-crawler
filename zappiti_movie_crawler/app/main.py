@@ -79,6 +79,8 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "github_commit_message": "Update Zappiti media catalog",
     "local_output_dir": "/data/output",
     "request_timeout_seconds": 20,
+    "publish_require_all_sources_reachable": True,
+    "publish_allow_empty_catalog": False,
 }
 
 STOP_REQUESTED = False
@@ -1206,6 +1208,28 @@ def make_asset_files(catalog: dict[str, Any], options: dict[str, Any]) -> dict[s
     }
 
 
+def catalog_publish_blockers(catalog: dict[str, Any], options: dict[str, Any]) -> list[str]:
+    blockers: list[str] = []
+    stats = catalog.get("stats") or {}
+
+    if STOP_REQUESTED:
+        blockers.append("scan was interrupted")
+
+    if not options.get("publish_allow_empty_catalog", False) and int(stats.get("total") or 0) == 0:
+        blockers.append("scan found 0 media files")
+
+    if options.get("publish_require_all_sources_reachable", True):
+        offline_sources = [
+            str(status.get("name") or "unnamed")
+            for status in catalog.get("sources", [])
+            if not status.get("reachable")
+        ]
+        if offline_sources:
+            blockers.append(f"unreachable sources: {', '.join(offline_sources)}")
+
+    return blockers
+
+
 def write_local_outputs(files: dict[str, bytes], output_dir: str) -> None:
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -1219,6 +1243,16 @@ def write_local_outputs(files: dict[str, bytes], output_dir: str) -> None:
 def run_once(options: dict[str, Any]) -> None:
     started = time.monotonic()
     catalog = crawl(options)
+    blockers = catalog_publish_blockers(catalog, options)
+    if blockers:
+        elapsed = time.monotonic() - started
+        logging.error(
+            "Skipping catalog write and GitHub publish after %.1f seconds because scan is incomplete: %s",
+            elapsed,
+            "; ".join(blockers),
+        )
+        return
+
     files = make_asset_files(catalog, options)
     write_local_outputs(files, str(options["local_output_dir"]))
 
