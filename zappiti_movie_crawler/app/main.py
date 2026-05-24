@@ -60,6 +60,7 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "smb_username": "guest",
     "smb_password": "guest",
     "smb_require_signing": False,
+    "smb_require_secure_negotiate": False,
     "prefer_mounted_paths": True,
     "enable_smb_fallback": True,
     "min_file_size_mb": 10,
@@ -365,6 +366,9 @@ class SourceScanner:
         server, _share, _subpath = parsed
         try:
             smbclient.reset_connection_cache()
+            smbclient.ClientConfig(
+                require_secure_negotiate=bool(self.options.get("smb_require_secure_negotiate", False))
+            )
             smbclient.register_session(
                 server,
                 username=str(self.options.get("smb_username") or ""),

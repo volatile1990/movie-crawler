@@ -1,5 +1,5 @@
 name: Zappiti Movie Crawler
-version: "0.1.4"
+version: "0.1.5"
 slug: zappiti_movie_crawler
 description: Crawl Zappiti movie shares and publish the catalog to GitHub assets.
 url: https://github.com/volatile1990/movie-crawler
@@ -31,6 +31,7 @@ options:
   smb_username: guest
   smb_password: guest
   smb_require_signing: false
+  smb_require_secure_negotiate: false
   prefer_mounted_paths: true
   enable_smb_fallback: true
   min_file_size_mb: 10
@@ -63,6 +64,7 @@ schema:
   smb_username: str
   smb_password: password
   smb_require_signing: bool
+  smb_require_secure_negotiate: bool
   prefer_mounted_paths: bool
   enable_smb_fallback: bool
   min_file_size_mb: int
