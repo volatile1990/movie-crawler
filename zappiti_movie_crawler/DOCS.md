@@ -10,7 +10,7 @@ The add-on writes these files locally to `/data/output/assets/` and publishes th
 - `assets/zappiti-catalog.min.json`: minified full catalog for frontend use
 - `assets/zappiti-catalog-summary.json`: source status and counts only
 
-Each catalog item includes the source, library, relative path, title/year parsing, size, modified date, optional `ffprobe` media information, optional NFO metadata, and optional TMDB metadata.
+Each catalog item includes the source, library, relative path, title/year parsing, size, modified date, optional `ffprobe` media information, optional NFO metadata, optional TMDB metadata, optional episode metadata, and optional IMDb ratings for movies.
 
 ## Source Handling
 
@@ -29,7 +29,9 @@ Do not commit the token to this add-on repository. Keep it only in the Home Assi
 
 ## Optional Configuration
 
-Set `tmdb_api_key` to enrich movies and series with TMDB IDs, descriptions, genres, poster URLs, backdrop URLs, ratings, and runtime information.
+Set `tmdb_api_key` to enrich movies and series with TMDB IDs, descriptions, genres, poster URLs, backdrop URLs, ratings, runtime information, and missing TV episode titles. Episode titles are only filled when the filename or local NFO did not already provide one.
+
+`enable_imdb_ratings` downloads and caches IMDb's non-commercial `title.ratings.tsv.gz` dataset, then adds `imdb_rating`, `imdb_votes`, and `imdb_url` to movie catalog items when an IMDb ID is available from TMDB or a local NFO file. `imdb_cache_ttl_hours` controls how long the downloaded rating lookups are reused before refreshing.
 
 `enable_ffprobe` extracts duration, resolution, codecs, and audio stream data for files available through the mounted Home Assistant media paths. Direct SMB fallback scanning still catalogs files, but cannot run `ffprobe` without a mounted filesystem path.
 

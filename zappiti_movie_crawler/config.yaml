@@ -1,5 +1,5 @@
 name: Zappiti Movie Crawler
-version: "0.1.0"
+version: "0.1.1"
 slug: zappiti_movie_crawler
 description: Crawl Zappiti movie shares and publish the catalog to GitHub assets.
 url: https://github.com/volatile1990/movie-crawler
@@ -40,6 +40,9 @@ options:
   tmdb_api_key: ""
   tmdb_language: de-DE
   tmdb_region: DE
+  enable_imdb_ratings: true
+  imdb_ratings_dataset_url: https://datasets.imdbws.com/title.ratings.tsv.gz
+  imdb_cache_ttl_hours: 24
   github_repo: volatile1990/eclipse-cinema-homepage
   github_branch: main
   github_token: ""
@@ -66,6 +69,9 @@ schema:
   tmdb_api_key: password
   tmdb_language: str
   tmdb_region: str
+  enable_imdb_ratings: bool
+  imdb_ratings_dataset_url: str
+  imdb_cache_ttl_hours: int
   github_repo: str
   github_branch: str
   github_token: password

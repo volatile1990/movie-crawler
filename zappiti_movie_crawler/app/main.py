@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import base64
+import csv
+import gzip
+import io
 import hashlib
 import json
 import logging
@@ -11,7 +14,7 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -66,6 +69,9 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "tmdb_api_key": "",
     "tmdb_language": "de-DE",
     "tmdb_region": "DE",
+    "enable_imdb_ratings": True,
+    "imdb_ratings_dataset_url": "https://datasets.imdbws.com/title.ratings.tsv.gz",
+    "imdb_cache_ttl_hours": 24,
     "github_repo": "volatile1990/eclipse-cinema-homepage",
     "github_branch": "main",
     "github_token": "",
@@ -109,6 +115,7 @@ def load_options() -> dict[str, Any]:
     options["scan_interval_minutes"] = max(1, int(options["scan_interval_minutes"]))
     options["min_file_size_mb"] = max(0, int(options["min_file_size_mb"]))
     options["request_timeout_seconds"] = max(5, int(options["request_timeout_seconds"]))
+    options["imdb_cache_ttl_hours"] = max(1, int(options["imdb_cache_ttl_hours"]))
     return options
 
 
@@ -465,21 +472,73 @@ def xml_text(root: ET.Element, *names: str) -> str | None:
     return None
 
 
+def xml_int(root: ET.Element, *names: str) -> int | None:
+    value = xml_text(root, *names)
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def xml_uniqueid(root: ET.Element, uniqueid_type: str) -> str | None:
+    for element in root.findall("uniqueid"):
+        if (element.get("type") or "").lower() == uniqueid_type and element.text:
+            return element.text.strip()
+    return None
+
+
+def xml_imdb_id(root: ET.Element) -> str | None:
+    imdb_id = xml_text(root, "imdbid") or xml_uniqueid(root, "imdb")
+    if imdb_id:
+        return imdb_id
+    uniqueid = xml_text(root, "uniqueid")
+    match = re.search(r"\btt\d+\b", uniqueid or "")
+    return match.group(0) if match else None
+
+
 def xml_metadata(root: ET.Element) -> dict[str, Any]:
     genres = [element.text.strip() for element in root.findall("genre") if element.text]
     year = extract_year(xml_text(root, "year", "premiered", "releasedate"))
     metadata = {
+        "metadata_type": root.tag.lower(),
         "provider": "nfo",
         "title": xml_text(root, "title"),
+        "show_title": xml_text(root, "showtitle"),
         "original_title": xml_text(root, "originaltitle"),
         "year": year,
         "overview": xml_text(root, "plot", "outline"),
-        "imdb_id": xml_text(root, "imdbid", "uniqueid"),
-        "tmdb_id": xml_text(root, "tmdbid"),
+        "imdb_id": xml_imdb_id(root),
+        "tmdb_id": xml_text(root, "tmdbid") or xml_uniqueid(root, "tmdb"),
+        "season": xml_int(root, "season"),
+        "episode": xml_int(root, "episode"),
         "runtime_minutes": xml_text(root, "runtime"),
         "genres": genres,
     }
     return {key: value for key, value in metadata.items() if value not in (None, "", [])}
+
+
+def apply_nfo_metadata(item: dict[str, Any], metadata: dict[str, Any]) -> None:
+    item["local_metadata"] = metadata
+    metadata_type = str(metadata.get("metadata_type") or "")
+
+    if item.get("kind") == "tv":
+        if metadata.get("show_title"):
+            item["title"] = metadata["show_title"]
+        elif metadata_type != "episodedetails" and metadata.get("title"):
+            item["title"] = metadata["title"]
+
+        if metadata_type == "episodedetails" and metadata.get("title") and not item.get("episode_title"):
+            item["episode_title"] = metadata["title"]
+        if metadata.get("season") is not None and item.get("season") in (None, "", []):
+            item["season"] = metadata["season"]
+        if metadata.get("episode") is not None and item.get("episode") in (None, "", []):
+            item["episode"] = metadata["episode"]
+        return
+
+    item["title"] = metadata.get("title") or item.get("title")
+    item["year"] = metadata.get("year") or item.get("year")
 
 
 def ffprobe(path: str, timeout_seconds: int) -> dict[str, Any] | None:
@@ -536,6 +595,34 @@ def ffprobe(path: str, timeout_seconds: int) -> dict[str, Any] | None:
     return json_safe(media_info)
 
 
+def coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        match = re.search(r"\d+", value)
+        return int(match.group(0)) if match else None
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            number = coerce_int(item)
+            if number is not None:
+                return number
+    return None
+
+
+def coerce_int_list(value: Any) -> list[int]:
+    raw_values = value if isinstance(value, (list, tuple, set)) else [value]
+    numbers: list[int] = []
+    for raw_value in raw_values:
+        number = coerce_int(raw_value)
+        if number is not None and number not in numbers:
+            numbers.append(number)
+    return numbers
+
+
 class TmdbClient:
     def __init__(self, options: dict[str, Any]) -> None:
         self.api_key = str(options.get("tmdb_api_key") or "").strip()
@@ -581,6 +668,26 @@ class TmdbClient:
         self.cache[cache_key] = metadata
         return metadata
 
+    def enrich_episodes(self, item: dict[str, Any], series_metadata: dict[str, Any] | None) -> list[dict[str, Any]]:
+        if not self.api_key or item.get("kind") != "tv" or not series_metadata:
+            return []
+
+        series_tmdb_id = coerce_int(series_metadata.get("tmdb_id"))
+        season = coerce_int(item.get("season"))
+        episodes = coerce_int_list(item.get("episode"))
+        if not series_tmdb_id or season is None or not episodes:
+            return []
+
+        results: list[dict[str, Any]] = []
+        for episode in episodes:
+            cache_key = f"episode|{series_tmdb_id}|{season}|{episode}|{self.language}"
+            if cache_key not in self.cache:
+                self.cache[cache_key] = self.episode_details(series_tmdb_id, season, episode)
+            metadata = self.cache.get(cache_key)
+            if metadata:
+                results.append(metadata)
+        return results
+
     def search(self, kind: str, title: str, year: int | None) -> dict[str, Any] | None:
         endpoint = "movie" if kind == "movie" else "tv"
         params: dict[str, Any] = {
@@ -615,6 +722,17 @@ class TmdbClient:
             },
         )
         return self.normalize(kind, details or best)
+
+    def episode_details(self, series_tmdb_id: int, season: int, episode: int) -> dict[str, Any] | None:
+        details = self.tmdb_get(
+            f"/tv/{series_tmdb_id}/season/{season}/episode/{episode}",
+            {
+                "api_key": self.api_key,
+                "language": self.language,
+                "append_to_response": "external_ids",
+            },
+        )
+        return self.normalize_episode(details) if details else None
 
     def tmdb_get(self, path: str, params: dict[str, Any]) -> dict[str, Any] | None:
         url = f"https://api.themoviedb.org/3{path}"
@@ -678,6 +796,26 @@ class TmdbClient:
             metadata["number_of_episodes"] = payload.get("number_of_episodes")
         return {key: value for key, value in metadata.items() if value not in (None, "", [])}
 
+    @staticmethod
+    def normalize_episode(payload: dict[str, Any]) -> dict[str, Any]:
+        external_ids = payload.get("external_ids") or {}
+        metadata = {
+            "provider": "tmdb",
+            "tmdb_id": payload.get("id"),
+            "imdb_id": external_ids.get("imdb_id"),
+            "title": payload.get("name"),
+            "overview": payload.get("overview"),
+            "air_date": payload.get("air_date"),
+            "year": extract_year(payload.get("air_date")),
+            "season": payload.get("season_number"),
+            "episode": payload.get("episode_number"),
+            "runtime_minutes": payload.get("runtime"),
+            "vote_average": payload.get("vote_average"),
+            "vote_count": payload.get("vote_count"),
+            "still_url": tmdb_image_url(payload.get("still_path"), "w300"),
+        }
+        return {key: value for key, value in metadata.items() if value not in (None, "", [])}
+
 
 def normalize_title_for_match(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())
@@ -687,6 +825,152 @@ def tmdb_image_url(path: str | None, size: str) -> str | None:
     if not path:
         return None
     return f"https://image.tmdb.org/t/p/{size}{path}"
+
+
+def normalize_imdb_id(value: Any) -> str | None:
+    if not value:
+        return None
+    match = re.search(r"\btt\d+\b", str(value))
+    return match.group(0) if match else None
+
+
+def imdb_id_for_item(item: dict[str, Any]) -> str | None:
+    for container in (item, item.get("metadata"), item.get("local_metadata")):
+        if isinstance(container, dict):
+            imdb_id = normalize_imdb_id(container.get("imdb_id"))
+            if imdb_id:
+                return imdb_id
+    return None
+
+
+class ImdbRatingsClient:
+    def __init__(self, options: dict[str, Any]) -> None:
+        self.enabled = bool(options.get("enable_imdb_ratings", True))
+        self.dataset_url = str(options.get("imdb_ratings_dataset_url") or "").strip()
+        self.timeout = int(options["request_timeout_seconds"])
+        self.ttl = timedelta(hours=int(options["imdb_cache_ttl_hours"]))
+        self.cache_path = Path("/data/cache/imdb_ratings_cache.json")
+        self.cache = self.load_cache()
+
+    def load_cache(self) -> dict[str, Any]:
+        if not self.cache_path.exists():
+            return {"ratings": {}, "missing": {}}
+        try:
+            with self.cache_path.open("r", encoding="utf-8") as handle:
+                cache = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return {"ratings": {}, "missing": {}}
+        if not isinstance(cache, dict):
+            return {"ratings": {}, "missing": {}}
+        cache.setdefault("ratings", {})
+        cache.setdefault("missing", {})
+        return cache
+
+    def save_cache(self) -> None:
+        if not self.enabled:
+            return
+        try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.cache_path.open("w", encoding="utf-8") as handle:
+                json.dump(self.cache, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        except OSError as exc:
+            logging.warning("Cannot write IMDb ratings cache: %s", exc)
+
+    def lookup_many(self, imdb_ids: set[str]) -> dict[str, dict[str, Any]]:
+        if not self.enabled or not self.dataset_url or not imdb_ids:
+            return {}
+
+        normalized_ids = {imdb_id for imdb_id in (normalize_imdb_id(value) for value in imdb_ids) if imdb_id}
+        if not normalized_ids:
+            return {}
+
+        ratings = self.cached_ratings()
+        missing = self.cached_missing()
+        fresh = self.cache_is_fresh()
+        result = {imdb_id: ratings[imdb_id] for imdb_id in normalized_ids if fresh and imdb_id in ratings}
+        needed = sorted(
+            imdb_id
+            for imdb_id in normalized_ids
+            if not fresh or (imdb_id not in ratings and imdb_id not in missing)
+        )
+        if not needed:
+            return result
+
+        downloaded = self.download_ratings(set(needed))
+        if downloaded is None:
+            return {imdb_id: ratings[imdb_id] for imdb_id in normalized_ids if imdb_id in ratings}
+
+        checked_at = utc_now()
+        for imdb_id in needed:
+            if imdb_id in downloaded:
+                ratings[imdb_id] = downloaded[imdb_id]
+                missing.pop(imdb_id, None)
+            else:
+                ratings.pop(imdb_id, None)
+                missing[imdb_id] = checked_at
+
+        self.cache["dataset_url"] = self.dataset_url
+        self.cache["fetched_at"] = checked_at
+        return {imdb_id: ratings[imdb_id] for imdb_id in normalized_ids if imdb_id in ratings}
+
+    def cached_ratings(self) -> dict[str, dict[str, Any]]:
+        ratings = self.cache.get("ratings")
+        if not isinstance(ratings, dict):
+            ratings = {}
+            self.cache["ratings"] = ratings
+        return ratings
+
+    def cached_missing(self) -> dict[str, str]:
+        missing = self.cache.get("missing")
+        if not isinstance(missing, dict):
+            missing = {}
+            self.cache["missing"] = missing
+        return missing
+
+    def cache_is_fresh(self) -> bool:
+        if self.cache.get("dataset_url") != self.dataset_url:
+            return False
+        fetched_at = self.cache.get("fetched_at")
+        if not isinstance(fetched_at, str):
+            return False
+        try:
+            timestamp = datetime.fromisoformat(fetched_at)
+        except ValueError:
+            return False
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return timestamp + self.ttl > datetime.now(timezone.utc)
+
+    def download_ratings(self, imdb_ids: set[str]) -> dict[str, dict[str, Any]] | None:
+        remaining = set(imdb_ids)
+        found: dict[str, dict[str, Any]] = {}
+        headers = {"User-Agent": "zappiti-movie-crawler/0.1"}
+        logging.info("Downloading IMDb ratings dataset for %s title IDs.", len(remaining))
+        try:
+            with requests.get(self.dataset_url, headers=headers, stream=True, timeout=self.timeout) as response:
+                if response.status_code >= 400:
+                    logging.warning("IMDb ratings dataset returned HTTP %s.", response.status_code)
+                    return None
+                response.raw.decode_content = False
+                with gzip.GzipFile(fileobj=response.raw) as gzip_file:
+                    with io.TextIOWrapper(gzip_file, encoding="utf-8", newline="") as text_file:
+                        reader = csv.DictReader(text_file, delimiter="\t")
+                        for row in reader:
+                            imdb_id = row.get("tconst")
+                            if imdb_id not in remaining:
+                                continue
+                            found[imdb_id] = {
+                                "provider": "imdb",
+                                "rating": float(row["averageRating"]),
+                                "votes": int(row["numVotes"]),
+                            }
+                            remaining.remove(imdb_id)
+                            if not remaining:
+                                break
+        except (OSError, EOFError, ValueError, csv.Error, requests.RequestException, gzip.BadGzipFile) as exc:
+            logging.warning("Cannot load IMDb ratings dataset: %s", exc)
+            return None
+        return found
 
 
 class GithubPublisher:
@@ -778,8 +1062,60 @@ def parse_github_repo(value: str) -> tuple[str, str]:
     return parts[-2], parts[-1]
 
 
+def apply_episode_metadata(item: dict[str, Any], episodes: list[dict[str, Any]]) -> None:
+    if not episodes:
+        return
+
+    item["episode_metadata"] = episodes[0] if len(episodes) == 1 else episodes
+    if item.get("episode_title"):
+        return
+
+    titles = [str(episode["title"]) for episode in episodes if episode.get("title")]
+    if not titles:
+        return
+    item["episode_title"] = " / ".join(titles)
+    if len(titles) > 1:
+        item["episode_titles"] = titles
+
+
+def apply_imdb_rating(item: dict[str, Any], imdb_id: str, rating: dict[str, Any]) -> None:
+    item["imdb_id"] = imdb_id
+    item["imdb_rating"] = rating["rating"]
+    item["imdb_votes"] = rating["votes"]
+    item["imdb_url"] = f"https://www.imdb.com/title/{imdb_id}/"
+
+    metadata = item.get("metadata")
+    if isinstance(metadata, dict):
+        if not metadata.get("imdb_id"):
+            metadata["imdb_id"] = imdb_id
+        metadata["imdb_rating"] = rating["rating"]
+        metadata["imdb_votes"] = rating["votes"]
+
+
+def apply_imdb_ratings(items: list[dict[str, Any]], imdb: ImdbRatingsClient) -> None:
+    movie_imdb_ids: set[str] = set()
+    for item in items:
+        if item.get("kind") != "movie":
+            continue
+        imdb_id = imdb_id_for_item(item)
+        if imdb_id:
+            movie_imdb_ids.add(imdb_id)
+
+    ratings = imdb.lookup_many(movie_imdb_ids)
+    if not ratings:
+        return
+
+    for item in items:
+        if item.get("kind") != "movie":
+            continue
+        imdb_id = imdb_id_for_item(item)
+        if imdb_id and imdb_id in ratings:
+            apply_imdb_rating(item, imdb_id, ratings[imdb_id])
+
+
 def enrich_items(items: list[dict[str, Any]], options: dict[str, Any]) -> list[dict[str, Any]]:
     tmdb = TmdbClient(options)
+    imdb = ImdbRatingsClient(options)
     enriched: list[dict[str, Any]] = []
     for index, item in enumerate(items, 1):
         if STOP_REQUESTED:
@@ -787,9 +1123,7 @@ def enrich_items(items: list[dict[str, Any]], options: dict[str, Any]) -> list[d
         item.update(parse_file_metadata(item))
         nfo = read_local_nfo(item)
         if nfo:
-            item["local_metadata"] = nfo
-            item["title"] = nfo.get("title") or item.get("title")
-            item["year"] = nfo.get("year") or item.get("year")
+            apply_nfo_metadata(item, nfo)
 
         if options.get("enable_ffprobe") and item.get("_local_path"):
             media_info = ffprobe(str(item["_local_path"]), int(options["request_timeout_seconds"]))
@@ -800,11 +1134,16 @@ def enrich_items(items: list[dict[str, Any]], options: dict[str, Any]) -> list[d
         if tmdb_metadata:
             item["metadata"] = tmdb_metadata
 
+        if item.get("kind") == "tv" and not item.get("episode_title"):
+            apply_episode_metadata(item, tmdb.enrich_episodes(item, item.get("metadata")))
+
         if index % 100 == 0:
             logging.info("Enriched %s/%s media files.", index, len(items))
         enriched.append(item)
 
     tmdb.save_cache()
+    apply_imdb_ratings(enriched, imdb)
+    imdb.save_cache()
     return enriched
 
 
