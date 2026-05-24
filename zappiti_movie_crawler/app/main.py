@@ -1,0 +1,931 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import logging
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import requests
+import smbclient
+from guessit import guessit
+
+
+VIDEO_EXTENSIONS = {
+    ".avi",
+    ".bdmv",
+    ".divx",
+    ".iso",
+    ".m2ts",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".mts",
+    ".ts",
+    ".vob",
+    ".webm",
+    ".wmv",
+}
+
+DEFAULT_OPTIONS: dict[str, Any] = {
+    "sources": [
+        {
+            "name": "Zappiti1",
+            "mounted_path": "/media/Zappiti1",
+            "smb_unc": r"\\192.168.1.91\Volume_9a4a7d5c4a7d365b",
+        },
+        {
+            "name": "Zappiti2",
+            "mounted_path": "/media/Zappiti2",
+            "smb_unc": r"\\192.168.1.91\Volume_ca7a3d6d7a3d5801",
+        },
+    ],
+    "libraries": ["FILME", "SERIEN", "DEMOS"],
+    "smb_username": "guest",
+    "smb_password": "guest",
+    "prefer_mounted_paths": True,
+    "enable_smb_fallback": True,
+    "min_file_size_mb": 10,
+    "enable_ffprobe": True,
+    "run_on_start": True,
+    "run_once": False,
+    "scan_interval_minutes": 360,
+    "tmdb_api_key": "",
+    "tmdb_language": "de-DE",
+    "tmdb_region": "DE",
+    "github_repo": "volatile1990/eclipse-cinema-homepage",
+    "github_branch": "main",
+    "github_token": "",
+    "github_assets_prefix": "assets",
+    "github_commit_message": "Update Zappiti media catalog",
+    "local_output_dir": "/data/output",
+    "request_timeout_seconds": 20,
+}
+
+STOP_REQUESTED = False
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(message)s",
+        stream=sys.stdout,
+    )
+
+
+def request_stop(signum: int, _frame: Any) -> None:
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
+    logging.info("Received signal %s, stopping after current step.", signum)
+
+
+def load_options() -> dict[str, Any]:
+    options = dict(DEFAULT_OPTIONS)
+    options_path = Path(os.environ.get("CRAWLER_OPTIONS_PATH", "/data/options.json"))
+    if options_path.exists():
+        with options_path.open("r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        options.update(loaded)
+    else:
+        logging.warning("Options file %s not found; using defaults.", options_path)
+
+    options["scan_interval_minutes"] = max(1, int(options["scan_interval_minutes"]))
+    options["min_file_size_mb"] = max(0, int(options["min_file_size_mb"]))
+    options["request_timeout_seconds"] = max(5, int(options["request_timeout_seconds"]))
+    return options
+
+
+def stable_id(*parts: str) -> str:
+    digest = hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
+def json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def iso_from_timestamp(timestamp: float | int | None) -> str | None:
+    if timestamp is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(timestamp), timezone.utc).replace(microsecond=0).isoformat()
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def normalize_path_part(value: str) -> str:
+    return value.replace("\\", "/").strip("/")
+
+
+def clean_title(raw: str) -> str:
+    stem = Path(raw).stem
+    stem = re.sub(r"[\._]+", " ", stem)
+    stem = re.sub(r"\b(480p|576p|720p|1080p|2160p|4k|uhd|hdr|dv|bluray|blu-ray|web-dl|webrip|hdtv|x264|x265|h264|h265|hevc|remux|proper|repack)\b", " ", stem, flags=re.I)
+    stem = re.sub(r"[\[\(]?(19|20)\d{2}[\]\)]?", " ", stem)
+    stem = re.sub(r"\s+", " ", stem)
+    return stem.strip(" -._")
+
+
+def extract_year(*values: str | None) -> int | None:
+    for value in values:
+        if not value:
+            continue
+        match = re.search(r"\b(19|20)\d{2}\b", value)
+        if match:
+            return int(match.group(0))
+    return None
+
+
+def is_season_folder(value: str) -> bool:
+    return bool(re.search(r"\b(season|staffel|saison)\s*\d+\b|\bs\d{1,2}\b", value, flags=re.I))
+
+
+def kind_for_library(library: str) -> str:
+    normalized = library.upper()
+    if normalized == "FILME":
+        return "movie"
+    if normalized == "SERIEN":
+        return "tv"
+    if normalized == "DEMOS":
+        return "demo"
+    return "video"
+
+
+def should_skip_path(parts: list[str]) -> bool:
+    skip_names = {"@eadir", "$recycle.bin", "recycler", "system volume information"}
+    return any(part.startswith(".") or part.lower() in skip_names for part in parts)
+
+
+def build_item(
+    source_name: str,
+    library: str,
+    relative_parts: list[str],
+    file_name: str,
+    size_bytes: int | None,
+    modified_at: str | None,
+    local_path: str | None = None,
+    smb_path: str | None = None,
+) -> dict[str, Any]:
+    relative_path = "/".join([library, *relative_parts, file_name])
+    item = {
+        "id": stable_id(source_name, relative_path),
+        "source": source_name,
+        "library": library,
+        "kind": kind_for_library(library),
+        "relative_path": relative_path,
+        "display_path": f"{source_name}/{relative_path}",
+        "file_name": file_name,
+        "extension": Path(file_name).suffix.lower(),
+        "size_bytes": size_bytes,
+        "modified_at": modified_at,
+    }
+    if local_path:
+        item["_local_path"] = local_path
+    if smb_path:
+        item["_smb_path"] = smb_path
+    return item
+
+
+class SourceScanner:
+    def __init__(self, source: dict[str, Any], options: dict[str, Any]) -> None:
+        self.source = source
+        self.options = options
+        self.name = source.get("name") or "unnamed"
+        self.libraries = [str(library) for library in options["libraries"]]
+        self.min_size_bytes = int(options["min_file_size_mb"]) * 1024 * 1024
+
+    def scan(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        if self.options.get("prefer_mounted_paths", True):
+            items, status = self.scan_mounted_path()
+            if status["reachable"]:
+                return items, status
+
+        if self.options.get("enable_smb_fallback", True):
+            return self.scan_smb()
+
+        items, status = self.scan_mounted_path()
+        return items, status
+
+    def scan_mounted_path(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        root = Path(str(self.source.get("mounted_path") or ""))
+        status = {
+            "name": self.name,
+            "mode": "mounted_path",
+            "path": str(root),
+            "reachable": False,
+            "libraries": [],
+            "message": "",
+        }
+        if not root.is_dir():
+            status["message"] = "Mounted path is not available."
+            return [], status
+
+        items: list[dict[str, Any]] = []
+        status["reachable"] = True
+        for library in self.libraries:
+            library_path = root / library
+            library_status = {"name": library, "reachable": False, "files": 0}
+            if not library_path.is_dir():
+                library_status["message"] = "Library folder is not available."
+                status["libraries"].append(library_status)
+                continue
+
+            library_status["reachable"] = True
+            try:
+                for path in library_path.rglob("*"):
+                    if STOP_REQUESTED:
+                        break
+                    if not path.is_file():
+                        continue
+                    if path.suffix.lower() not in VIDEO_EXTENSIONS:
+                        continue
+                    relative_parts = list(path.relative_to(library_path).parts[:-1])
+                    if should_skip_path([library, *relative_parts, path.name]):
+                        continue
+                    try:
+                        stat = path.stat()
+                    except OSError as exc:
+                        logging.warning("Cannot stat %s: %s", path, exc)
+                        continue
+                    if stat.st_size < self.min_size_bytes:
+                        continue
+                    items.append(
+                        build_item(
+                            self.name,
+                            library,
+                            relative_parts,
+                            path.name,
+                            stat.st_size,
+                            iso_from_timestamp(stat.st_mtime),
+                            local_path=str(path),
+                        )
+                    )
+                    library_status["files"] += 1
+            except OSError as exc:
+                library_status["message"] = str(exc)
+                logging.warning("Cannot scan %s: %s", library_path, exc)
+            status["libraries"].append(library_status)
+
+        status["files"] = len(items)
+        return items, status
+
+    def scan_smb(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        unc = str(self.source.get("smb_unc") or "")
+        status = {
+            "name": self.name,
+            "mode": "smb",
+            "path": unc,
+            "reachable": False,
+            "libraries": [],
+            "message": "",
+        }
+        parsed = parse_unc(unc)
+        if not parsed:
+            status["message"] = "SMB UNC path is invalid."
+            return [], status
+
+        server, _share, _subpath = parsed
+        try:
+            smbclient.register_session(
+                server,
+                username=str(self.options.get("smb_username") or ""),
+                password=str(self.options.get("smb_password") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001
+            status["message"] = f"SMB login failed: {exc}"
+            logging.warning("SMB login failed for %s: %s", self.name, exc)
+            return [], status
+
+        items: list[dict[str, Any]] = []
+        status["reachable"] = True
+        for library in self.libraries:
+            library_root = join_unc(unc, library)
+            library_status = {"name": library, "reachable": False, "files": 0}
+            try:
+                for item in self.walk_smb_library(library, library_root, []):
+                    items.append(item)
+                    library_status["files"] += 1
+                library_status["reachable"] = True
+            except Exception as exc:  # noqa: BLE001
+                library_status["message"] = str(exc)
+                logging.warning("Cannot scan SMB folder %s: %s", library_root, exc)
+            status["libraries"].append(library_status)
+
+        status["files"] = len(items)
+        return items, status
+
+    def walk_smb_library(self, library: str, directory: str, relative_parts: list[str]) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for entry in smbclient.scandir(directory):
+            if STOP_REQUESTED:
+                break
+            name = entry.name
+            if should_skip_path([library, *relative_parts, name]):
+                continue
+            child = join_unc(directory, name)
+            if entry.is_dir():
+                items.extend(self.walk_smb_library(library, child, [*relative_parts, name]))
+                continue
+            if not entry.is_file() or Path(name).suffix.lower() not in VIDEO_EXTENSIONS:
+                continue
+            stat = entry.stat()
+            size = getattr(stat, "st_size", None)
+            if size is not None and int(size) < self.min_size_bytes:
+                continue
+            modified = iso_from_timestamp(getattr(stat, "st_mtime", None))
+            items.append(build_item(self.name, library, relative_parts, name, size, modified, smb_path=child))
+        return items
+
+
+def parse_unc(value: str) -> tuple[str, str, str] | None:
+    normalized = value.replace("/", "\\").rstrip("\\")
+    match = re.match(r"^\\\\([^\\]+)\\([^\\]+)(?:\\(.*))?$", normalized)
+    if not match:
+        return None
+    return match.group(1), match.group(2), match.group(3) or ""
+
+
+def join_unc(base: str, *parts: str) -> str:
+    normalized = base.replace("/", "\\").rstrip("\\")
+    suffix = "\\".join(part.strip("\\/") for part in parts if part)
+    return f"{normalized}\\{suffix}" if suffix else normalized
+
+
+def parse_file_metadata(item: dict[str, Any]) -> dict[str, Any]:
+    kind = item["kind"]
+    relative_parts = item["relative_path"].split("/")[:-1]
+    file_name = item["file_name"]
+    guess_type = "episode" if kind == "tv" else "movie"
+    guessed = json_safe(guessit(file_name, {"type": guess_type}))
+
+    title = guessed.get("title") if isinstance(guessed, dict) else None
+    if kind == "tv":
+        title = title_from_series_path(relative_parts) or title or clean_title(file_name)
+    else:
+        title = title or title_from_movie_path(relative_parts, file_name) or clean_title(file_name)
+
+    year = None
+    if isinstance(guessed, dict):
+        year_value = guessed.get("year")
+        if isinstance(year_value, int):
+            year = year_value
+    year = year or extract_year(file_name, *relative_parts)
+
+    parsed = {
+        "title": title,
+        "year": year,
+        "parsed": guessed,
+    }
+    if isinstance(guessed, dict):
+        for source_key, target_key in (
+            ("season", "season"),
+            ("episode", "episode"),
+            ("episode_title", "episode_title"),
+            ("screen_size", "screen_size"),
+            ("source", "source_quality"),
+            ("video_codec", "video_codec"),
+            ("audio_codec", "audio_codec"),
+        ):
+            if source_key in guessed:
+                parsed[target_key] = json_safe(guessed[source_key])
+    return parsed
+
+
+def title_from_series_path(relative_parts: list[str]) -> str | None:
+    candidates = [part for part in relative_parts[1:] if not is_season_folder(part)]
+    if candidates:
+        return clean_title(candidates[0])
+    return None
+
+
+def title_from_movie_path(relative_parts: list[str], file_name: str) -> str | None:
+    if len(relative_parts) < 2:
+        return None
+    parent = relative_parts[-1]
+    if clean_title(file_name).lower() in {"movie", "film", "video"}:
+        return clean_title(parent)
+    parent_title = clean_title(parent)
+    file_title = clean_title(file_name)
+    if parent_title and len(parent_title) > len(file_title):
+        return parent_title
+    return None
+
+
+def read_local_nfo(item: dict[str, Any]) -> dict[str, Any] | None:
+    local_path = item.get("_local_path")
+    if not local_path:
+        return None
+    video_path = Path(local_path)
+    candidates = [
+        video_path.with_suffix(".nfo"),
+        video_path.parent / "movie.nfo",
+        video_path.parent / "tvshow.nfo",
+    ]
+    for candidate in candidates:
+        if not candidate.exists() or candidate.stat().st_size > 1024 * 1024:
+            continue
+        try:
+            raw = candidate.read_text(encoding="utf-8", errors="ignore")
+            root = ET.fromstring(raw.strip())
+        except (OSError, ET.ParseError) as exc:
+            logging.debug("Cannot parse NFO %s: %s", candidate, exc)
+            continue
+        return xml_metadata(root)
+    return None
+
+
+def xml_text(root: ET.Element, *names: str) -> str | None:
+    for name in names:
+        element = root.find(name)
+        if element is not None and element.text:
+            return element.text.strip()
+    return None
+
+
+def xml_metadata(root: ET.Element) -> dict[str, Any]:
+    genres = [element.text.strip() for element in root.findall("genre") if element.text]
+    year = extract_year(xml_text(root, "year", "premiered", "releasedate"))
+    metadata = {
+        "provider": "nfo",
+        "title": xml_text(root, "title"),
+        "original_title": xml_text(root, "originaltitle"),
+        "year": year,
+        "overview": xml_text(root, "plot", "outline"),
+        "imdb_id": xml_text(root, "imdbid", "uniqueid"),
+        "tmdb_id": xml_text(root, "tmdbid"),
+        "runtime_minutes": xml_text(root, "runtime"),
+        "genres": genres,
+    }
+    return {key: value for key, value in metadata.items() if value not in (None, "", [])}
+
+
+def ffprobe(path: str, timeout_seconds: int) -> dict[str, Any] | None:
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        path,
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout_seconds, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logging.debug("ffprobe failed for %s: %s", path, exc)
+        return None
+    if completed.returncode != 0:
+        logging.debug("ffprobe returned %s for %s: %s", completed.returncode, path, completed.stderr.strip())
+        return None
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return None
+
+    media_info: dict[str, Any] = {}
+    fmt = payload.get("format") or {}
+    if fmt.get("duration"):
+        media_info["duration_seconds"] = int(float(fmt["duration"]))
+    if fmt.get("bit_rate"):
+        media_info["bit_rate"] = int(fmt["bit_rate"])
+
+    video_streams = [stream for stream in payload.get("streams", []) if stream.get("codec_type") == "video"]
+    audio_streams = [stream for stream in payload.get("streams", []) if stream.get("codec_type") == "audio"]
+    if video_streams:
+        stream = video_streams[0]
+        media_info["video"] = {
+            "codec": stream.get("codec_name"),
+            "width": stream.get("width"),
+            "height": stream.get("height"),
+            "profile": stream.get("profile"),
+            "pix_fmt": stream.get("pix_fmt"),
+        }
+    if audio_streams:
+        media_info["audio"] = [
+            {
+                "codec": stream.get("codec_name"),
+                "channels": stream.get("channels"),
+                "language": (stream.get("tags") or {}).get("language"),
+            }
+            for stream in audio_streams[:8]
+        ]
+    return json_safe(media_info)
+
+
+class TmdbClient:
+    def __init__(self, options: dict[str, Any]) -> None:
+        self.api_key = str(options.get("tmdb_api_key") or "").strip()
+        self.language = str(options.get("tmdb_language") or "de-DE")
+        self.region = str(options.get("tmdb_region") or "DE")
+        self.timeout = int(options["request_timeout_seconds"])
+        self.cache_path = Path("/data/cache/tmdb_cache.json")
+        self.cache = self.load_cache()
+
+    def load_cache(self) -> dict[str, Any]:
+        if not self.cache_path.exists():
+            return {}
+        try:
+            with self.cache_path.open("r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def save_cache(self) -> None:
+        if not self.api_key:
+            return
+        try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.cache_path.open("w", encoding="utf-8") as handle:
+                json.dump(self.cache, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        except OSError as exc:
+            logging.warning("Cannot write TMDB cache: %s", exc)
+
+    def enrich(self, item: dict[str, Any]) -> dict[str, Any] | None:
+        if not self.api_key:
+            return None
+        if item["kind"] not in {"movie", "tv"}:
+            return None
+        title = item.get("title")
+        if not title:
+            return None
+        year = item.get("year")
+        cache_key = f"{item['kind']}|{title.lower()}|{year or ''}|{self.language}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+
+        metadata = self.search(item["kind"], str(title), year)
+        self.cache[cache_key] = metadata
+        return metadata
+
+    def search(self, kind: str, title: str, year: int | None) -> dict[str, Any] | None:
+        endpoint = "movie" if kind == "movie" else "tv"
+        params: dict[str, Any] = {
+            "api_key": self.api_key,
+            "query": title,
+            "language": self.language,
+            "include_adult": "false",
+        }
+        if self.region:
+            params["region"] = self.region
+        if year:
+            params["primary_release_year" if kind == "movie" else "first_air_date_year"] = year
+
+        result = self.tmdb_get(f"/search/{endpoint}", params)
+        if not result or not result.get("results"):
+            if year:
+                params.pop("primary_release_year" if kind == "movie" else "first_air_date_year", None)
+                result = self.tmdb_get(f"/search/{endpoint}", params)
+        if not result or not result.get("results"):
+            return None
+
+        best = self.choose_best_result(kind, title, year, result["results"])
+        if not best:
+            return None
+
+        details = self.tmdb_get(
+            f"/{endpoint}/{best['id']}",
+            {
+                "api_key": self.api_key,
+                "language": self.language,
+                "append_to_response": "external_ids",
+            },
+        )
+        return self.normalize(kind, details or best)
+
+    def tmdb_get(self, path: str, params: dict[str, Any]) -> dict[str, Any] | None:
+        url = f"https://api.themoviedb.org/3{path}"
+        try:
+            response = requests.get(url, params=params, timeout=self.timeout)
+        except requests.RequestException as exc:
+            logging.warning("TMDB request failed: %s", exc)
+            return None
+        if response.status_code == 429:
+            time.sleep(2)
+            return self.tmdb_get(path, params)
+        if response.status_code >= 400:
+            logging.warning("TMDB returned HTTP %s for %s", response.status_code, path)
+            return None
+        return response.json()
+
+    @staticmethod
+    def choose_best_result(kind: str, title: str, year: int | None, results: list[dict[str, Any]]) -> dict[str, Any] | None:
+        normalized_title = normalize_title_for_match(title)
+
+        def score(result: dict[str, Any]) -> tuple[int, float]:
+            result_title = result.get("title" if kind == "movie" else "name") or ""
+            result_year = extract_year(result.get("release_date" if kind == "movie" else "first_air_date"))
+            title_score = 2 if normalize_title_for_match(result_title) == normalized_title else 0
+            year_score = 1 if year and result_year == year else 0
+            return title_score + year_score, float(result.get("popularity") or 0)
+
+        return sorted(results, key=score, reverse=True)[0] if results else None
+
+    @staticmethod
+    def normalize(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if kind == "movie":
+            date = payload.get("release_date")
+            title = payload.get("title")
+            original_title = payload.get("original_title")
+        else:
+            date = payload.get("first_air_date")
+            title = payload.get("name")
+            original_title = payload.get("original_name")
+
+        external_ids = payload.get("external_ids") or {}
+        metadata = {
+            "provider": "tmdb",
+            "tmdb_id": payload.get("id"),
+            "imdb_id": external_ids.get("imdb_id"),
+            "title": title,
+            "original_title": original_title,
+            "overview": payload.get("overview"),
+            "release_date": date,
+            "year": extract_year(date),
+            "genres": [genre.get("name") for genre in payload.get("genres", []) if genre.get("name")],
+            "runtime_minutes": payload.get("runtime") or payload.get("episode_run_time"),
+            "vote_average": payload.get("vote_average"),
+            "vote_count": payload.get("vote_count"),
+            "poster_url": tmdb_image_url(payload.get("poster_path"), "w500"),
+            "backdrop_url": tmdb_image_url(payload.get("backdrop_path"), "w1280"),
+            "homepage": payload.get("homepage"),
+        }
+        if kind == "tv":
+            metadata["number_of_seasons"] = payload.get("number_of_seasons")
+            metadata["number_of_episodes"] = payload.get("number_of_episodes")
+        return {key: value for key, value in metadata.items() if value not in (None, "", [])}
+
+
+def normalize_title_for_match(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def tmdb_image_url(path: str | None, size: str) -> str | None:
+    if not path:
+        return None
+    return f"https://image.tmdb.org/t/p/{size}{path}"
+
+
+class GithubPublisher:
+    def __init__(self, options: dict[str, Any]) -> None:
+        self.token = str(options.get("github_token") or "").strip()
+        self.owner, self.repo = parse_github_repo(str(options["github_repo"]))
+        self.branch = str(options.get("github_branch") or "").strip()
+        self.timeout = int(options["request_timeout_seconds"])
+        self.api_base = f"https://api.github.com/repos/{self.owner}/{self.repo}"
+
+    def publish(self, files: dict[str, bytes], message: str) -> dict[str, Any]:
+        if not self.token:
+            return {"published": False, "reason": "github_token is empty"}
+
+        branch = self.branch or self.default_branch()
+        ref = self.request("GET", f"{self.api_base}/git/ref/heads/{branch}")
+        head_sha = ref["object"]["sha"]
+        commit = self.request("GET", f"{self.api_base}/git/commits/{head_sha}")
+        base_tree_sha = commit["tree"]["sha"]
+
+        tree_entries = []
+        for path, content in sorted(files.items()):
+            blob = self.request(
+                "POST",
+                f"{self.api_base}/git/blobs",
+                {
+                    "content": base64.b64encode(content).decode("ascii"),
+                    "encoding": "base64",
+                },
+            )
+            tree_entries.append(
+                {
+                    "path": path,
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": blob["sha"],
+                }
+            )
+
+        tree = self.request(
+            "POST",
+            f"{self.api_base}/git/trees",
+            {"base_tree": base_tree_sha, "tree": tree_entries},
+        )
+        new_commit = self.request(
+            "POST",
+            f"{self.api_base}/git/commits",
+            {"message": message, "tree": tree["sha"], "parents": [head_sha]},
+        )
+        self.request(
+            "PATCH",
+            f"{self.api_base}/git/refs/heads/{branch}",
+            {"sha": new_commit["sha"], "force": False},
+        )
+        return {"published": True, "commit_sha": new_commit["sha"], "branch": branch}
+
+    def default_branch(self) -> str:
+        repo = self.request("GET", self.api_base)
+        return repo.get("default_branch") or "main"
+
+    def request(self, method: str, url: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {self.token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        try:
+            response = requests.request(method, url, json=payload, headers=headers, timeout=self.timeout)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"GitHub request failed: {exc}") from exc
+        if response.status_code >= 400:
+            raise RuntimeError(f"GitHub returned HTTP {response.status_code}: {response.text[:500]}")
+        if not response.content:
+            return {}
+        return response.json()
+
+
+def parse_github_repo(value: str) -> tuple[str, str]:
+    repo = value.strip()
+    if repo.startswith("http://") or repo.startswith("https://"):
+        path = urlparse(repo).path.strip("/")
+    else:
+        path = repo
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = [part for part in path.split("/") if part]
+    if len(parts) < 2:
+        raise ValueError(f"Invalid github_repo value: {value}")
+    return parts[-2], parts[-1]
+
+
+def enrich_items(items: list[dict[str, Any]], options: dict[str, Any]) -> list[dict[str, Any]]:
+    tmdb = TmdbClient(options)
+    enriched: list[dict[str, Any]] = []
+    for index, item in enumerate(items, 1):
+        if STOP_REQUESTED:
+            break
+        item.update(parse_file_metadata(item))
+        nfo = read_local_nfo(item)
+        if nfo:
+            item["local_metadata"] = nfo
+            item["title"] = nfo.get("title") or item.get("title")
+            item["year"] = nfo.get("year") or item.get("year")
+
+        if options.get("enable_ffprobe") and item.get("_local_path"):
+            media_info = ffprobe(str(item["_local_path"]), int(options["request_timeout_seconds"]))
+            if media_info:
+                item["media_info"] = media_info
+
+        tmdb_metadata = tmdb.enrich(item)
+        if tmdb_metadata:
+            item["metadata"] = tmdb_metadata
+
+        if index % 100 == 0:
+            logging.info("Enriched %s/%s media files.", index, len(items))
+        enriched.append(item)
+
+    tmdb.save_cache()
+    return enriched
+
+
+def crawl(options: dict[str, Any]) -> dict[str, Any]:
+    statuses: list[dict[str, Any]] = []
+    items: list[dict[str, Any]] = []
+    for source in options["sources"]:
+        scanner = SourceScanner(source, options)
+        logging.info("Scanning source %s.", scanner.name)
+        source_items, status = scanner.scan()
+        statuses.append(status)
+        items.extend(source_items)
+        logging.info("Source %s yielded %s files.", scanner.name, len(source_items))
+
+    items = enrich_items(items, options)
+    public_items = [strip_private_fields(item) for item in items]
+    public_items.sort(key=lambda item: (item.get("kind") or "", str(item.get("title") or "").lower(), item["relative_path"]))
+    stats = build_stats(public_items, statuses)
+
+    return {
+        "schema_version": 1,
+        "generated_at": utc_now(),
+        "sources": statuses,
+        "stats": stats,
+        "items": public_items,
+    }
+
+
+def strip_private_fields(item: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in item.items() if not key.startswith("_")}
+
+
+def build_stats(items: list[dict[str, Any]], statuses: list[dict[str, Any]]) -> dict[str, Any]:
+    by_kind: dict[str, int] = {}
+    by_library: dict[str, int] = {}
+    for item in items:
+        by_kind[item["kind"]] = by_kind.get(item["kind"], 0) + 1
+        by_library[item["library"]] = by_library.get(item["library"], 0) + 1
+    return {
+        "total": len(items),
+        "by_kind": by_kind,
+        "by_library": by_library,
+        "reachable_sources": sum(1 for status in statuses if status.get("reachable")),
+        "offline_sources": sum(1 for status in statuses if not status.get("reachable")),
+    }
+
+
+def make_asset_files(catalog: dict[str, Any], options: dict[str, Any]) -> dict[str, bytes]:
+    prefix = normalize_path_part(str(options.get("github_assets_prefix") or "assets"))
+    summary = {
+        "schema_version": catalog["schema_version"],
+        "generated_at": catalog["generated_at"],
+        "stats": catalog["stats"],
+        "sources": catalog["sources"],
+    }
+    return {
+        f"{prefix}/zappiti-catalog.json": json.dumps(catalog, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"),
+        f"{prefix}/zappiti-catalog.min.json": json.dumps(catalog, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8"),
+        f"{prefix}/zappiti-catalog-summary.json": json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"),
+    }
+
+
+def write_local_outputs(files: dict[str, bytes], output_dir: str) -> None:
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    for path, content in files.items():
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    logging.info("Wrote catalog assets to %s.", root)
+
+
+def run_once(options: dict[str, Any]) -> None:
+    started = time.monotonic()
+    catalog = crawl(options)
+    files = make_asset_files(catalog, options)
+    write_local_outputs(files, str(options["local_output_dir"]))
+
+    publisher = GithubPublisher(options)
+    result = publisher.publish(files, str(options["github_commit_message"]))
+    if result.get("published"):
+        logging.info("Published catalog to GitHub commit %s.", result["commit_sha"])
+    else:
+        logging.warning("Catalog was not published: %s.", result.get("reason"))
+
+    elapsed = time.monotonic() - started
+    logging.info("Scan finished in %.1f seconds with %s items.", elapsed, catalog["stats"]["total"])
+
+
+def sleep_interruptibly(seconds: int) -> None:
+    deadline = time.monotonic() + seconds
+    while not STOP_REQUESTED and time.monotonic() < deadline:
+        time.sleep(min(5, max(0, deadline - time.monotonic())))
+
+
+def main() -> int:
+    configure_logging()
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+
+    options = load_options()
+    if options.get("run_on_start", True):
+        run_once(options)
+
+    if options.get("run_once", False):
+        return 0
+
+    while not STOP_REQUESTED:
+        interval_seconds = int(options["scan_interval_minutes"]) * 60
+        logging.info("Next scan in %s minutes.", options["scan_interval_minutes"])
+        sleep_interruptibly(interval_seconds)
+        if STOP_REQUESTED:
+            break
+        options = load_options()
+        run_once(options)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Crawler failed: %s", exc)
+        raise SystemExit(1) from exc
