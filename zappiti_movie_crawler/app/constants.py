@@ -62,6 +62,9 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "request_timeout_seconds": 20,
     "publish_require_all_sources_reachable": True,
     "publish_allow_empty_catalog": False,
+    "min_files_per_library": [],
+    "max_item_drop_percent": 20,
+    "skip_github_push_when_unchanged": True,
 }
 
 RETRYABLE_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}

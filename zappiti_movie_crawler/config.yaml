@@ -54,6 +54,9 @@ options:
   request_timeout_seconds: 20
   publish_require_all_sources_reachable: true
   publish_allow_empty_catalog: false
+  min_files_per_library: []
+  max_item_drop_percent: 20
+  skip_github_push_when_unchanged: true
 schema:
   sources:
     - name: str
@@ -87,3 +90,8 @@ schema:
   request_timeout_seconds: int
   publish_require_all_sources_reachable: bool
   publish_allow_empty_catalog: bool
+  min_files_per_library:
+    - name: str
+      min_files: int
+  max_item_drop_percent: int
+  skip_github_push_when_unchanged: bool

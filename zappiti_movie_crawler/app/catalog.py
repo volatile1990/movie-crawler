@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -18,7 +19,10 @@ from metadata import (
 from runtime import stop_requested
 from scanner import SourceScanner, unreachable_libraries
 from tmdb_client import TmdbClient
-from utils import atomic_write_bytes, normalize_path_part, utc_now
+from utils import atomic_write_bytes, atomic_write_json, normalize_path_part, utc_now
+
+
+PUBLISH_STATE_FILENAME = ".publish_state.json"
 
 
 def apply_episode_metadata(item: dict[str, Any], episodes: list[dict[str, Any]]) -> None:
@@ -165,6 +169,145 @@ def make_asset_files(catalog: dict[str, Any], options: dict[str, Any]) -> dict[s
     }
 
 
+def catalog_asset_path(options: dict[str, Any]) -> Path:
+    prefix = normalize_path_part(str(options.get("github_assets_prefix") or "assets")) or "assets"
+    return Path(str(options["local_output_dir"])) / prefix / "zappiti-catalog.json"
+
+
+def previous_catalog(options: dict[str, Any]) -> dict[str, Any] | None:
+    path = catalog_asset_path(options)
+    if not path.is_file():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        logging.warning("Cannot read previous catalog %s: %s", path, exc)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def library_count_blockers(catalog: dict[str, Any], options: dict[str, Any]) -> list[str]:
+    minimums = options.get("min_files_per_library")
+    if not isinstance(minimums, list) or not minimums:
+        return []
+    by_library = ((catalog.get("stats") or {}).get("by_library")) or {}
+    if not isinstance(by_library, dict):
+        return ["catalog stats by_library is not an object"]
+
+    blockers: list[str] = []
+    for entry in minimums:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        try:
+            threshold = int(entry.get("min_files", 0))
+        except (TypeError, ValueError):
+            continue
+        if not name or threshold <= 0:
+            continue
+        actual = int(by_library.get(name) or 0)
+        if actual < threshold:
+            blockers.append(
+                f"library {name} has {actual} files, minimum is {threshold}"
+            )
+    return blockers
+
+
+def drop_blockers(
+    catalog: dict[str, Any],
+    previous: dict[str, Any] | None,
+    options: dict[str, Any],
+) -> list[str]:
+    if not isinstance(previous, dict):
+        return []
+    try:
+        max_drop = int(options.get("max_item_drop_percent") or 0)
+    except (TypeError, ValueError):
+        return []
+    if max_drop <= 0:
+        return []
+
+    previous_stats = previous.get("stats") or {}
+    current_stats = catalog.get("stats") or {}
+    if not isinstance(previous_stats, dict) or not isinstance(current_stats, dict):
+        return []
+
+    blockers: list[str] = []
+    try:
+        previous_total = int(previous_stats.get("total") or 0)
+        current_total = int(current_stats.get("total") or 0)
+    except (TypeError, ValueError):
+        return []
+
+    if previous_total > 0:
+        drop_percent = (previous_total - current_total) * 100 / previous_total
+        if drop_percent > max_drop:
+            blockers.append(
+                f"item count dropped {drop_percent:.1f}% "
+                f"(from {previous_total} to {current_total}); "
+                f"maximum allowed drop is {max_drop}%"
+            )
+
+    previous_by_library = previous_stats.get("by_library") or {}
+    current_by_library = current_stats.get("by_library") or {}
+    if isinstance(previous_by_library, dict) and isinstance(current_by_library, dict):
+        for library, prev_value in previous_by_library.items():
+            try:
+                prev_count = int(prev_value)
+            except (TypeError, ValueError):
+                continue
+            if prev_count <= 0:
+                continue
+            try:
+                curr_count = int(current_by_library.get(library) or 0)
+            except (TypeError, ValueError):
+                curr_count = 0
+            lib_drop_percent = (prev_count - curr_count) * 100 / prev_count
+            if lib_drop_percent > max_drop:
+                blockers.append(
+                    f"library {library} dropped {lib_drop_percent:.1f}% "
+                    f"(from {prev_count} to {curr_count}); "
+                    f"maximum allowed drop is {max_drop}%"
+                )
+    return blockers
+
+
+def files_signature(files: dict[str, bytes]) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(files):
+        digest.update(path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(files[path])
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def publish_state_path(options: dict[str, Any]) -> Path:
+    return Path(str(options["local_output_dir"])) / PUBLISH_STATE_FILENAME
+
+
+def read_publish_state(options: dict[str, Any]) -> dict[str, Any]:
+    path = publish_state_path(options)
+    if not path.is_file():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        logging.warning("Cannot read publish state %s: %s", path, exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_publish_state(options: dict[str, Any], state: dict[str, Any]) -> None:
+    path = publish_state_path(options)
+    try:
+        atomic_write_json(path, state)
+    except OSError as exc:
+        logging.warning("Cannot write publish state %s: %s", path, exc)
+
+
 def catalog_publish_blockers(catalog: dict[str, Any], options: dict[str, Any]) -> list[str]:
     blockers: list[str] = []
     stats = catalog.get("stats") or {}
@@ -280,7 +423,12 @@ def write_local_outputs(files: dict[str, bytes], output_dir: str) -> None:
 def run_once(options: dict[str, Any]) -> None:
     started = time.monotonic()
     catalog = crawl(options)
-    blockers = catalog_publish_blockers(catalog, options)
+    previous = previous_catalog(options)
+    blockers = (
+        catalog_publish_blockers(catalog, options)
+        + library_count_blockers(catalog, options)
+        + drop_blockers(catalog, previous, options)
+    )
     if blockers:
         elapsed = time.monotonic() - started
         logging.error(
@@ -306,6 +454,23 @@ def run_once(options: dict[str, Any]) -> None:
     except (OSError, RuntimeError) as exc:
         logging.error("Cannot write local catalog assets: %s", exc)
 
+    signature = files_signature(files)
+    state = read_publish_state(options)
+    already_published = (
+        bool(options.get("skip_github_push_when_unchanged", True))
+        and state.get("files_signature") == signature
+        and state.get("last_commit_sha")
+    )
+    if already_published:
+        elapsed = time.monotonic() - started
+        logging.info(
+            "Catalog is unchanged since last successful publish (commit %s); skipping GitHub push after %.1f seconds with %s items.",
+            state["last_commit_sha"],
+            elapsed,
+            catalog["stats"]["total"],
+        )
+        return
+
     try:
         publisher = GithubPublisher(options)
         result = publisher.publish(files, str(options["github_commit_message"]))
@@ -314,6 +479,16 @@ def run_once(options: dict[str, Any]) -> None:
     else:
         if result.get("published"):
             logging.info("Published catalog to GitHub commit %s.", result["commit_sha"])
+            write_publish_state(
+                options,
+                {
+                    "files_signature": signature,
+                    "last_commit_sha": result["commit_sha"],
+                    "branch": result.get("branch"),
+                    "published_at": utc_now(),
+                    "item_count": catalog["stats"]["total"],
+                },
+            )
         else:
             logging.warning("Catalog was not published: %s.", result.get("reason"))
 
